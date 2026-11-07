@@ -195,3 +195,30 @@ def test_reads_port_from_environment():
 # ---------------------------------------------------------------------------
 # Add your own tests below, e.g. "with two aces preflop my bot raises".
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# eqlib / preflop table
+# ---------------------------------------------------------------------------
+
+def test_vectorized_scores_match_evaluator():
+    import numpy as np
+    from eqlib import omaha_scores
+    from evaluator import omaha_score
+
+    rng = np.random.default_rng(1)
+    d = np.argsort(rng.random((300, 36)), axis=1)[:, :10]
+    got = omaha_scores(d[:, :5], d[:, 5:])
+    exp = [omaha_score(list(r[:5]), list(r[5:])) for r in d]
+    assert list(got) == exp
+
+
+def test_preflop_equity_table():
+    from eqlib import preflop_equity
+    from evaluator import cards_from_str
+
+    good = preflop_equity(cards_from_str("AsAhKsKhQs"))
+    bad = preflop_equity(cards_from_str("6c7d8h9sTc"))
+    assert 0.6 < good < 0.7 and good > bad
+    # suit-isomorphic hands share one value
+    assert preflop_equity(cards_from_str("AcAdKcKdQc")) == good
