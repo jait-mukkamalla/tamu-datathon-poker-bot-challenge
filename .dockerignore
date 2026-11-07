@@ -1,0 +1,17 @@
+# Left out of the bot's Docker image. The bot only needs agent.py, game.py,
+# evaluator.py, requirements.txt and any data/model files it loads at runtime.
+.git
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Local testing and practice tools: never imported by agent.py
+tools/
+baseline-bots/
+judge_engine.py
+test_agent.py
+requirements-dev.txt
+README.md
