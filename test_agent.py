@@ -222,3 +222,25 @@ def test_preflop_equity_table():
     assert 0.6 < good < 0.7 and good > bad
     # suit-isomorphic hands share one value
     assert preflop_equity(cards_from_str("AcAdKcKdQc")) == good
+
+
+def test_postflop_equity_orders_hands():
+    from eqlib import postflop_equity
+    from evaluator import cards_from_str
+
+    board = cards_from_str("Ah Kh 7c")
+    flushy = postflop_equity(cards_from_str("Qh Jh 6d 7d 8s"), board)   # weak made hand
+    trips = postflop_equity(cards_from_str("Ad As 6d 8c 9s"), board)    # trip aces
+    assert 0.0 < flushy < 1.0 and trips > 0.7 and trips > flushy
+
+
+def test_heuristic_always_returns_legal_action():
+    import agent
+
+    rng = random.Random(5)
+    for hand in range(60):
+        game = Game(make_deal(7, hand), button_seat=hand % 2, hand_index=hand)
+        while not game.is_terminal:
+            obs = game.observation(game.to_act)
+            assert agent.choose_action(obs, {}) in obs.legal_actions
+            game.apply(rng.choice(obs.legal_actions))

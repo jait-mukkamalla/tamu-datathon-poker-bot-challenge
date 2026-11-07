@@ -60,20 +60,25 @@ def score_arrays() -> tuple[np.ndarray, np.ndarray]:
     return _T_NONFLUSH, _T_FLUSH
 
 
+_TRIPLES_BY_K = {k: np.array(list(combinations(range(k), 3)), dtype=np.int64) for k in (3, 4, 5)}
+
+
 def omaha_scores(hole: np.ndarray, board: np.ndarray) -> np.ndarray:
-    """Vectorized omaha_score. hole, board: int arrays of shape (N, 5).
-    Returns int32 scores of shape (N,), identical to evaluator.omaha_score."""
+    """Vectorized omaha_score. hole: (N, 5), board: (N, k) with k in 3, 4, 5
+    (a partial board scores the best made hand so far).
+    Returns int32 scores of shape (N,); for k = 5 identical to evaluator.omaha_score."""
     nonflush, flush = score_arrays()
+    tri = _TRIPLES_BY_K[board.shape[1]]
     hr, hs = CARD_RK[hole], CARD_SK[hole]    # (N, 5)
     br, bs = CARD_RK[board], CARD_SK[board]
     hr2 = hr[:, PAIRS[:, 0]] + hr[:, PAIRS[:, 1]]                            # (N, 10)
     hs2 = hs[:, PAIRS[:, 0]] + hs[:, PAIRS[:, 1]]
-    br3 = br[:, TRIPLES[:, 0]] + br[:, TRIPLES[:, 1]] + br[:, TRIPLES[:, 2]]
-    bs3 = bs[:, TRIPLES[:, 0]] + bs[:, TRIPLES[:, 1]] + bs[:, TRIPLES[:, 2]]
-    rk = hr2[:, :, None] + br3[:, None, :]                                    # (N, 10, 10)
+    br3 = br[:, tri[:, 0]] + br[:, tri[:, 1]] + br[:, tri[:, 2]]             # (N, T)
+    bs3 = bs[:, tri[:, 0]] + bs[:, tri[:, 1]] + bs[:, tri[:, 2]]
+    rk = hr2[:, :, None] + br3[:, None, :]                                    # (N, 10, T)
     sk = hs2[:, :, None] + bs3[:, None, :]
     sc = np.where(_FLUSH_SUMS[sk], flush[rk], nonflush[rk])
-    return sc.reshape(len(hole), 100).max(axis=1)
+    return sc.reshape(len(hole), -1).max(axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -116,3 +121,44 @@ def preflop_equity(hole) -> float:
         except Exception:
             _PREFLOP = np.full(376992, 32768, dtype=np.uint16)
     return float(_PREFLOP[combo_index(hole)]) / 65535.0
+
+
+# ---------------------------------------------------------------------------
+# Postflop made-hand equity (vs one random hand, from data/postflop_equity.npy)
+# ---------------------------------------------------------------------------
+
+POSTFLOP_PATH = os.path.join(_HERE, "data", "postflop_equity.npy")
+_POSTFLOP: np.ndarray | None = None
+_POSTFLOP_CAT: np.ndarray | None = None
+
+
+def _load_postflop() -> None:
+    global _POSTFLOP, _POSTFLOP_CAT
+    try:
+        t = np.load(POSTFLOP_PATH).astype(np.float64)
+    except Exception:
+        t = np.zeros((3, 9, 9, 2))
+        t[..., 0] = 0.5
+    cnt = t[..., 1]
+    cat_mean = (t[..., 0] * cnt).sum(axis=2) / np.maximum(cnt.sum(axis=2), 1)  # (3, 9)
+    cat_mean = np.where(cnt.sum(axis=2) > 0, cat_mean, 0.5)
+    w = cnt / (cnt + 300.0)
+    _POSTFLOP = w * t[..., 0] + (1 - w) * cat_mean[:, :, None]
+    _POSTFLOP_CAT = cat_mean
+
+
+def postflop_equity(hole, board) -> float:
+    """Approximate equity (0..1) vs a random hand from the best made hand on a
+    3-, 4- or 5-card board. Ignores draws and board texture beyond that."""
+    if _POSTFLOP is None:
+        _load_postflop()
+    sc = int(omaha_scores(np.array([hole]), np.array([board]))[0])
+    street = len(board) - 3
+    return float(_POSTFLOP[street, sc >> 20, (sc >> 16) & 15])
+
+
+def warm() -> None:
+    """Load every table now so the first decision pays no setup cost."""
+    score_arrays()
+    preflop_equity((0, 1, 2, 3, 4))
+    _load_postflop()
