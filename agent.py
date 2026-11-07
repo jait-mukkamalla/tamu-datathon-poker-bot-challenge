@@ -23,6 +23,7 @@ need to change it, and if you break it the judge can't talk to your bot.
 """
 
 import os
+import time
 import traceback
 
 import uvicorn
@@ -30,6 +31,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from evaluator import card_rank, card_suit, cards_to_str, omaha_score, warmup  # handy helpers, see evaluator.py
+from eqlib import postflop_equity_mc, preflop_equity, warm  # noqa: E402
 from game import Action, AgentConfig, HandResult, Observation, Street
 
 # Build omaha_score's lookup table now, while the server starts, instead of
@@ -37,6 +39,7 @@ from game import Action, AgentConfig, HandResult, Observation, Street
 # Do any other slow setup (loading a model, ...) here too: the server must
 # answer within 15 seconds of starting.
 warmup()
+warm()
 
 # rename as your team/bot's name
 PARTICIPANT = "TotallyAwesomeDatathonParticipant"
@@ -58,39 +61,68 @@ def new_half(config: AgentConfig, memory: dict) -> None:
     memory["hands_played"] = 0
 
 
-def choose_action(obs: Observation, memory: dict) -> Action:
-    """Called every time it is your turn. Return one of obs.legal_actions.
+# Thresholds are on equity vs a random hand, after shading for opponent aggression.
+SAMPLES = 300
+OPEN_POT, OPEN_HALF = 0.72, 0.58        # bet when checked to
+RAISE_POT_T, RAISE_HALF_T = 0.80, 0.68  # raise when facing a bet
+PRE_OPEN_POT, PRE_OPEN_HALF = 0.62, 0.55
+CALL_MARGIN = 0.04                      # extra equity over pot odds to call
+SHADE_SCALE, SHADE_PER_RAISE = 0.85, 0.04
+TIME_BUDGET = 4.5                       # target seconds of thinking per 1000-hand half
 
-    What you can see in obs:
-        hand_index          which hand of the half this is (0, 1, 2, ...)
-        street              Street.PREFLOP, Street.FLOP, Street.TURN or Street.RIVER
-        hole_cards          your 5 cards as ints, sorted ascending (0-35)
-        board               board (community) cards seen so far (0, 3, 4 or 5 ints)
-        pot                 total chips both players put in this hand
-        to_call             chips you must add to match the opponent
-        my_bet, opp_bet     chips you,opponent put in on THIS street
-        my_stack, opp_stack chips each player still has behind
-        is_button           True if you are the button (small blind)
-        legal_actions       the Actions you may return right now
-        raise_to            {RAISE_HALF: total, RAISE_POT: total} for legal raises
-        min_raise_to        smallest normal raise total (all-ins may be lower)
-        raises_this_street  raises so far this street (max 4)
-        action_history      this hand's actions so far; each has
-                            street, is_me, action, amount, street_total
-        big_blind           size of the big blind in chips
 
-    Actions: Action.FOLD, Action.CHECK_CALL, Action.RAISE_HALF, Action.RAISE_POT
-    Cards are ints: card_rank(c) is 0 (six) .. 8 (ace), card_suit(c) is 0..3,
-    and cards_to_str(obs.hole_cards) prints them like "6h 7c 9s Kd Ah".
-    Once all 5 board cards are out, omaha_score(obs.hole_cards, obs.board)
-    scores your hand (higher is better).
-    """
-
-    # Simple example of a heuristic bot, which just checks when it is of no cost, otherwise folds
-    # Replace this with your strategy!
-    if obs.to_call == 0:
+def _pick(obs: Observation, *prefs: Action) -> Action:
+    """First preferred action that is legal, else a safe legal fallback."""
+    for a in prefs:
+        if a in obs.legal_actions:
+            return a
+    if Action.CHECK_CALL in obs.legal_actions:
         return Action.CHECK_CALL
-    return Action.FOLD
+    return obs.legal_actions[0]
+
+
+def _decide(obs: Observation, memory: dict) -> Action:
+    t0 = time.perf_counter()
+    # Pace: spend at most TIME_BUDGET * (hands so far / 1000) (+1 s slack), else go cheap.
+    slow = memory.get("think", 0.0) > 1.0 + TIME_BUDGET * min(obs.hand_index + 1, 1000) / 1000
+    if obs.street == Street.PREFLOP:
+        e = preflop_equity(obs.hole_cards)
+    else:
+        e = postflop_equity_mc(obs.hole_cards, obs.board, 60 if slow else SAMPLES)
+    memory["think"] = memory.get("think", 0.0) + time.perf_counter() - t0
+
+    pre = obs.street == Street.PREFLOP
+    if obs.to_call == 0:
+        hi, lo = (PRE_OPEN_POT, PRE_OPEN_HALF) if pre else (OPEN_POT, OPEN_HALF)
+        if e >= hi:
+            return _pick(obs, Action.RAISE_POT, Action.RAISE_HALF, Action.CHECK_CALL)
+        if e >= lo:
+            return _pick(obs, Action.RAISE_HALF, Action.CHECK_CALL)
+        return _pick(obs, Action.CHECK_CALL)
+
+    # Facing a bet the opponent's range is stronger than random: shade equity down.
+    e_eff = 0.5 + (e - 0.5) * SHADE_SCALE - SHADE_PER_RAISE * obs.raises_this_street
+    pot_odds = obs.to_call / (obs.pot + obs.to_call)
+    hi, lo = (RAISE_POT_T - 0.14, RAISE_HALF_T - 0.10) if pre else (RAISE_POT_T, RAISE_HALF_T)
+    if e_eff >= hi:
+        return _pick(obs, Action.RAISE_POT, Action.RAISE_HALF, Action.CHECK_CALL)
+    if e_eff >= lo:
+        return _pick(obs, Action.RAISE_HALF, Action.CHECK_CALL)
+    if e_eff > pot_odds + CALL_MARGIN:
+        return _pick(obs, Action.CHECK_CALL)
+    return _pick(obs, Action.FOLD, Action.CHECK_CALL)
+
+
+def choose_action(obs: Observation, memory: dict) -> Action:
+    """Equity bot: preflop table + Monte Carlo postflop equity, pot-odds calls.
+    Never raises: falls back to a legal action."""
+    try:
+        return _decide(obs, memory)
+    except Exception:
+        traceback.print_exc()
+        if obs.to_call == 0 and Action.CHECK_CALL in obs.legal_actions:
+            return Action.CHECK_CALL
+        return _pick(obs, Action.FOLD, Action.CHECK_CALL)
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:

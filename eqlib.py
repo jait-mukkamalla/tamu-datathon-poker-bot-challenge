@@ -116,3 +116,39 @@ def preflop_equity(hole) -> float:
         except Exception:
             _PREFLOP = np.full(376992, 32768, dtype=np.uint16)
     return float(_PREFLOP[combo_index(hole)]) / 65535.0
+
+
+# ---------------------------------------------------------------------------
+# Postflop Monte Carlo equity (vs a uniformly random opponent hand)
+# ---------------------------------------------------------------------------
+
+_RNG = np.random.default_rng(12345)
+_ALL = np.arange(36)
+
+
+def postflop_equity_mc(hole, board, n: int = 400, rng=None) -> float:
+    """Equity (win + tie/2) of `hole` vs one random hand on a 3/4/5-card board,
+    by sampling n (opponent hand, board completion) pairs without replacement."""
+    rng = rng or _RNG
+    hole = np.asarray(hole, dtype=np.int64)
+    board = np.asarray(board, dtype=np.int64)
+    used = np.zeros(36, dtype=bool)
+    used[hole] = True
+    used[board] = True
+    unseen = _ALL[~used]
+    need = 5 - len(board)
+    # random 5 + need cards per sample: argsort of random keys = a shuffle per row
+    idx = np.argsort(rng.random((n, len(unseen))), axis=1)[:, : 5 + need]
+    draw = unseen[idx]
+    opp = draw[:, :5]
+    full = np.concatenate([np.broadcast_to(board, (n, len(board))), draw[:, 5:]], axis=1)
+    mine = omaha_scores(np.broadcast_to(hole, (n, 5)), full)
+    theirs = omaha_scores(opp, full)
+    return float(((mine > theirs).sum() + 0.5 * (mine == theirs).sum()) / n)
+
+
+def warm() -> None:
+    """Load every table now so the first decision pays no setup cost."""
+    score_arrays()
+    preflop_equity((0, 1, 2, 3, 4))
+    postflop_equity_mc((0, 1, 2, 3, 4), (10, 11, 12), 50)

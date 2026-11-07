@@ -222,3 +222,13 @@ def test_preflop_equity_table():
     assert 0.6 < good < 0.7 and good > bad
     # suit-isomorphic hands share one value
     assert preflop_equity(cards_from_str("AcAdKcKdQc")) == good
+
+
+def test_postflop_equity_mc_sane():
+    from eqlib import postflop_equity_mc
+    # board 3-3-3-5-6: holding the fourth 3 (quads) must beat a hand with no 3
+    board = (12, 13, 14, 20, 24)
+    strong = postflop_equity_mc((0, 5, 10, 15, 21), board, 300)
+    weak = postflop_equity_mc((0, 1, 4, 5, 8), board, 300)
+    assert 0.0 <= weak <= 1.0 and 0.0 <= strong <= 1.0
+    assert strong > weak
