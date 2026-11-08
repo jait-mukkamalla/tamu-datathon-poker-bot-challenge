@@ -68,7 +68,10 @@ RAISE_POT_T, RAISE_HALF_T = 0.80, 0.68  # raise when facing a bet
 PRE_OPEN_POT, PRE_OPEN_HALF = 0.62, 0.55
 CALL_MARGIN = 0.04                      # extra equity over pot odds to call
 SHADE_SCALE, SHADE_PER_RAISE = 0.85, 0.04
-TIME_BUDGET = 4.5                       # target seconds of thinking per 1000-hand half
+TIME_BUDGET = 2.0   # seconds of our own compute per half; the judge counts ~2x (HTTP overhead, load)
+MIN_SAMPLES = 20
+CALL_OVERHEAD = 3e-4  # fixed seconds per MC call (numpy setup), independent of sample count
+HANDS_PER_HALF = 1000
 
 
 def _pick(obs: Observation, *prefs: Action) -> Action:
@@ -81,17 +84,36 @@ def _pick(obs: Observation, *prefs: Action) -> Action:
     return obs.legal_actions[0]
 
 
+def _samples(obs: Observation, memory: dict) -> int:
+    """Monte Carlo sample count that spreads the remaining time budget evenly over
+    the decisions still expected this half, clamped to [MIN_SAMPLES, SAMPLES]."""
+    hands_done = max(obs.hand_index, 1)
+    calls_per_hand = memory.get("calls", 0) / hands_done if memory.get("calls") else 4.0
+    remaining = max((HANDS_PER_HALF - obs.hand_index) * max(calls_per_hand, 1.0), 1.0)
+    allowed = (TIME_BUDGET - memory.get("think", 0.0)) / remaining
+    cost = memory.get("cost", 8e-6)
+    n = int((allowed - CALL_OVERHEAD) / cost) if allowed > CALL_OVERHEAD else MIN_SAMPLES
+    n = max(MIN_SAMPLES, min(SAMPLES, n))
+    memory["last_n"] = n
+    return n
+
+
 def _decide(obs: Observation, memory: dict) -> Action:
     t0 = time.perf_counter()
-    # Pace: spend at most TIME_BUDGET * (hands so far / 1000) (+1 s slack), else go cheap.
-    slow = memory.get("think", 0.0) > 1.0 + TIME_BUDGET * min(obs.hand_index + 1, 1000) / 1000
-    if obs.street == Street.PREFLOP:
+    pre = obs.street == Street.PREFLOP
+    if pre:
         e = preflop_equity(obs.hole_cards)
     else:
-        e = postflop_equity_mc(obs.hole_cards, obs.board, 60 if slow else SAMPLES)
-    memory["think"] = memory.get("think", 0.0) + time.perf_counter() - t0
+        e = postflop_equity_mc(obs.hole_cards, obs.board, _samples(obs, memory))
+    dt = time.perf_counter() - t0
+    memory["think"] = memory.get("think", 0.0) + dt
+    memory["calls"] = memory.get("calls", 0) + 1
+    if not pre:
+        # EMA of seconds per sample, tracks machine speed/load
+        n = memory["last_n"]
+        b = max(dt - CALL_OVERHEAD, 1e-7) / n
+        memory["cost"] = 0.8 * memory.get("cost", b) + 0.2 * b
 
-    pre = obs.street == Street.PREFLOP
     if obs.to_call == 0:
         hi, lo = (PRE_OPEN_POT, PRE_OPEN_HALF) if pre else (OPEN_POT, OPEN_HALF)
         if e >= hi:
