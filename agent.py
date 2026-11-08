@@ -70,7 +70,7 @@ def new_half(config: AgentConfig, memory: dict) -> None:
 # search vs a pool of our earlier bots and baselines), last retuned with range-weighted
 # equity and bluffing on, and validated on held-out seeds against each opponent.
 P = {
-    "open_pot": 0.66, "open_half": 0.50,          # postflop, bet when checked to
+    "open_pot": 0.62, "open_half": 0.50,          # postflop, bet when checked to
     "raise_pot": 0.80, "raise_half": 0.68,        # postflop, raise when facing a bet
     "pre_open_pot": 0.62, "pre_open_half": 0.51,  # preflop, nothing to call beyond the blind
     "pre_raise_pot": 0.66, "pre_raise_half": 0.62,  # preflop, facing a raise
