@@ -25,6 +25,8 @@ import math
 import os
 import statistics
 import sys
+import random
+import zlib
 from concurrent.futures import ProcessPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,6 +36,10 @@ if ROOT not in sys.path:
 from game import AgentConfig, Game, button_for_deal, default_action, make_deal  # noqa: E402
 
 BIG_BLIND = 2
+# Old-style bots pace their Monte Carlo by measured time (a `_samples(obs, memory)`
+# function), so under parallel load their strength varies from run to run. In
+# simulation they are pinned to this many samples, about what they use for real.
+OLD_STYLE_SAMPLES = int(os.environ.get("SIM_OLD_SAMPLES", "120"))
 _SHARED: dict[str, dict] = {}    # dir -> {"eqlib": module, "oppmodel": module}
 _BOTS: dict[str, object] = {}    # spec key -> agent module
 _COUNTER = [0]
@@ -82,6 +88,12 @@ def load_bot(directory: str, params: dict | None = None):
                 sys.modules[k] = v
     if params and hasattr(mod, "P"):
         mod.P.update(params)
+    mod._sim_helpers = [m for m in shared.values()]
+    if callable(getattr(mod, "_samples", None)) and hasattr(mod, "SAMPLES"):
+        def _fixed_samples(obs, memory, _n=OLD_STYLE_SAMPLES):
+            memory["last_n"] = _n
+            return _n
+        mod._samples = _fixed_samples
     _BOTS[key] = mod
     return mod
 
@@ -90,7 +102,15 @@ class _Seat:
     def __init__(self, mod):
         self.mod, self.memory, self.errors = mod, {}, 0
 
-    def new_half(self):
+    def new_half(self, seed: int = 0):
+        # Reseed every random stream the bot could share across matches (its helper
+        # modules' _RNG and Python's random), so the same deals give the same games
+        # no matter which matches this worker process played before.
+        random.seed(seed)
+        for m in getattr(self.mod, "_sim_helpers", []):
+            if hasattr(m, "_RNG"):
+                import numpy as np
+                m._RNG = np.random.default_rng(seed)
         self.memory = {}
         self.mod.new_half(AgentConfig(), self.memory)
 
@@ -120,8 +140,8 @@ def play_duplicate(spec_a, spec_b, seed, deals: int = 1000) -> dict:
     for half in (0, 1):
         bots = (a, b) if half == 0 else (b, a)
         a_seat = 0 if half == 0 else 1
-        for bot in bots:
-            bot.new_half()
+        for i, bot in enumerate(bots):
+            bot.new_half(zlib.crc32(f"{seed}|{half}|{i}".encode()))
         for d in range(deals):
             game = Game(make_deal(seed, d), button_for_deal(d), hand_index=d)
             while not game.is_terminal:
