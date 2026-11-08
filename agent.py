@@ -26,12 +26,13 @@ import os
 import time
 import traceback
 
+import numpy as np
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from evaluator import card_rank, card_suit, cards_to_str, omaha_score, warmup  # handy helpers, see evaluator.py
-from eqlib import postflop_equity_mc, preflop_equity, warm  # noqa: E402
+from eqlib import equity, preflop_equity, warm  # noqa: E402
 import oppmodel
 from game import Action, AgentConfig, HandResult, Observation, Street
 
@@ -43,8 +44,8 @@ warmup()
 warm()
 
 # rename as your team/bot's name
-PARTICIPANT = "TotallyAwesomeDatathonParticipant"
-AGENT_NAME = "JustAsAwesomeAgent"
+PARTICIPANT = "jram"
+AGENT_NAME = "joker"
 
 
 # ===== YOUR CODE HERE =====
@@ -79,16 +80,29 @@ P = {
     "pre_off_btn": 0.0,    # preflop offset when we are the button
     "spr_coef": -0.03,     # offset -= spr_coef * (3 - min(SPR, 6)) / 3: >0 pushes harder when shallow
     "call_off_river": 0.02,  # extra river call margin
+    "jitter": 0.0,         # std of random noise added to equity before deciding (mixing)
 }
 try:  # LOCAL TUNING ONLY: the tournament never sets this variable
     import json as _json
     P.update(_json.loads(os.environ.get("BOT_PARAMS", "{}")))
 except Exception:
     pass
-SAMPLES = 300
-TIME_BUDGET = 2.0   # seconds of our own compute per half; the judge counts ~2x (HTTP overhead, load)
-MIN_SAMPLES = 20
-CALL_OVERHEAD = 3e-4  # fixed seconds per MC call (numpy setup), independent of sample count
+# Time pacing. The judge charges the wall time of every request minus 1 ms against an
+# 8 s bank per half. We measure our own functions (deciding, on_hand_end), add an
+# allowance per request for the server's JSON work, and spread TIME_TARGET over the half. The rest of the bank is margin for a slow or loaded
+# tournament host, where network/CPU-wait time we cannot see is also charged.
+TIME_TARGET = 4.5      # seconds of estimated request time we aim to use per half
+REQUEST_OVERHEAD = 3e-4  # seconds per request of server work outside our functions
+MC_MAX_TIME = 0.04     # hard ceiling on Monte Carlo time for one decision (limit is 1 s)
+CAP_FACTOR = 3.0       # sample cap = this x the average affordable count; early stopping
+                       # means most decisions use far fewer, and pacing absorbs the rest
+MIN_SAMPLES = 48
+MAX_SAMPLES = 4000
+CALL_OVERHEAD = 1.5e-4  # fixed seconds per MC call, independent of sample count
+Z_STOP = 3.0           # stop sampling once equity is this many std errors from every threshold
+# LOCAL TUNING ONLY: a fixed sample cap instead of time pacing, so parallel simulations
+# (where the machine is loaded) still compare candidates at the same accuracy.
+FIXED_CAP = int(os.environ.get("BOT_FIXED_CAP", "0") or 0)
 HANDS_PER_HALF = 1000
 
 
@@ -102,18 +116,36 @@ def _pick(obs: Observation, *prefs: Action) -> Action:
     return obs.legal_actions[0]
 
 
-def _samples(obs: Observation, memory: dict) -> int:
-    """Monte Carlo sample count that spreads the remaining time budget evenly over
-    the decisions still expected this half, clamped to [MIN_SAMPLES, SAMPLES]."""
+def _spent(memory: dict) -> float:
+    """Estimated seconds charged so far this half: time measured inside our own
+    functions (choose_action, on_hand_end) plus REQUEST_OVERHEAD per request for the
+    server work around them (JSON parsing and replies) that they cannot see."""
+    return memory.get("self_time", 0.0) + memory.get("reqs", 0) * REQUEST_OVERHEAD
+
+
+def _sample_cap(obs: Observation, memory: dict) -> int:
+    """Monte Carlo sample cap for this decision.
+
+    What is left of TIME_TARGET, minus the fixed cost of the requests still to come
+    (JSON, preflop, on_hand_end: measured as total time minus Monte Carlo time), is
+    shared over the Monte Carlo decisions still expected this half. Early stopping
+    usually ends well below the cap, and any over- or under-spend feeds back into the
+    next decisions' share."""
     hands_done = max(obs.hand_index, 1)
-    calls_per_hand = memory.get("calls", 0) / hands_done if memory.get("calls") else 4.0
-    remaining = max((HANDS_PER_HALF - obs.hand_index) * max(calls_per_hand, 1.0), 1.0)
-    allowed = (TIME_BUDGET - memory.get("think", 0.0)) / remaining
-    cost = memory.get("cost", 8e-6)
-    n = int((allowed - CALL_OVERHEAD) / cost) if allowed > CALL_OVERHEAD else MIN_SAMPLES
-    n = max(MIN_SAMPLES, min(SAMPLES, n))
-    memory["last_n"] = n
-    return n
+    reqs, mcs = memory.get("reqs", 0), memory.get("mcs", 0)
+    # per-hand rates, blended with priors (3.8 requests, 2 MC decisions) early on
+    w = min(1.0, hands_done / 50)
+    req_rate = w * reqs / hands_done + (1 - w) * 3.8
+    mc_rate = max(w * mcs / hands_done + (1 - w) * 2.0, 0.5)
+    spent = _spent(memory)
+    fixed = (spent - memory.get("mc_time", 0.0)) / reqs if reqs else 3e-4
+    left = HANDS_PER_HALF - obs.hand_index
+    mc_left = TIME_TARGET - spent - left * req_rate * max(fixed, 0.0)
+    per_call = mc_left / max(left * mc_rate, 1.0)
+    budget = min(MC_MAX_TIME, CAP_FACTOR * per_call)
+    cost = memory.get("cost", {}).get(len(obs.board), 2e-6)
+    n = int((budget - CALL_OVERHEAD) / cost) if budget > CALL_OVERHEAD else MIN_SAMPLES
+    return max(MIN_SAMPLES, min(MAX_SAMPLES, n))
 
 
 def _opp_adjust(obs: Observation, memory: dict, pre: bool) -> tuple[float, float, float]:
@@ -141,52 +173,89 @@ def _situation_offset(obs: Observation, pre: bool) -> float:
     return off - P["spr_coef"] * (3.0 - min(spr, 6.0)) / 3.0
 
 
-def _decide(obs: Observation, memory: dict) -> Action:
-    t0 = time.perf_counter()
-    pre = obs.street == Street.PREFLOP
-    if pre:
-        e = preflop_equity(obs.hole_cards)
-    else:
-        e = postflop_equity_mc(obs.hole_cards, obs.board, _samples(obs, memory))
-    dt = time.perf_counter() - t0
-    memory["think"] = memory.get("think", 0.0) + dt
-    memory["calls"] = memory.get("calls", 0) + 1
-    if not pre:
-        # EMA of seconds per sample, tracks machine speed/load
-        n = memory["last_n"]
-        b = max(dt - CALL_OVERHEAD, 1e-7) / n
-        memory["cost"] = 0.8 * memory.get("cost", b) + 0.2 * b
+def _policy(obs: Observation, memory: dict, pre: bool):
+    """Build the decision rule for this spot before any equity is computed.
 
+    Returns (act, thresholds): act(e) maps our raw equity vs a random hand to an
+    action, and thresholds are the raw-equity values where that action changes.
+    Knowing them up front lets the Monte Carlo stop once the decision is settled."""
     shade_adj, open_adj, margin_adj = _opp_adjust(obs, memory, pre)
     off = _situation_offset(obs, pre)
     if obs.to_call == 0:
         hi, lo = (P["pre_open_pot"], P["pre_open_half"]) if pre else (P["open_pot"], P["open_half"])
         hi, lo = hi + open_adj + off, lo + open_adj + off
-        if e >= hi:
-            return _pick(obs, Action.RAISE_POT, Action.RAISE_HALF, Action.CHECK_CALL)
-        if e >= lo:
-            return _pick(obs, Action.RAISE_HALF, Action.CHECK_CALL)
-        return _pick(obs, Action.CHECK_CALL)
 
-    # Facing a bet the opponent's range is stronger than random: shade equity down.
-    e_eff = (0.5 + (e - 0.5) * P["shade_scale"] - P["shade_per_raise"] * obs.raises_this_street
-             - shade_adj)
-    pot_odds = obs.to_call / (obs.pot + obs.to_call)
-    hi, lo = (P["pre_raise_pot"], P["pre_raise_half"]) if pre else (P["raise_pot"], P["raise_half"])
-    hi, lo = hi + off, lo + off
-    margin = P["call_margin"] + margin_adj + (P["call_off_river"] if obs.street == Street.RIVER else 0.0)
-    if e_eff >= hi:
-        return _pick(obs, Action.RAISE_POT, Action.RAISE_HALF, Action.CHECK_CALL)
-    if e_eff >= lo:
-        return _pick(obs, Action.RAISE_HALF, Action.CHECK_CALL)
-    if e_eff > pot_odds + margin:
-        return _pick(obs, Action.CHECK_CALL)
-    return _pick(obs, Action.FOLD, Action.CHECK_CALL)
+        def act(e: float) -> Action:
+            if e >= hi:
+                return _pick(obs, Action.RAISE_POT, Action.RAISE_HALF, Action.CHECK_CALL)
+            if e >= lo:
+                return _pick(obs, Action.RAISE_HALF, Action.CHECK_CALL)
+            return _pick(obs, Action.CHECK_CALL)
+        cuts = [hi, lo]
+    else:
+        # Facing a bet the opponent's range is stronger than random: shade equity down.
+        # e_eff = 0.5 + (e - 0.5) * scale - sub, a rising line, so its cutoffs map
+        # back to raw-equity cutoffs exactly.
+        scale = P["shade_scale"]
+        sub = P["shade_per_raise"] * obs.raises_this_street + shade_adj
+        pot_odds = obs.to_call / (obs.pot + obs.to_call)
+        hi, lo = (P["pre_raise_pot"], P["pre_raise_half"]) if pre else (P["raise_pot"], P["raise_half"])
+        hi, lo = hi + off, lo + off
+        margin = (P["call_margin"] + margin_adj
+                  + (P["call_off_river"] if obs.street == Street.RIVER else 0.0))
+        call_at = pot_odds + margin
+
+        def act(e: float) -> Action:
+            e_eff = 0.5 + (e - 0.5) * scale - sub
+            if e_eff >= hi:
+                return _pick(obs, Action.RAISE_POT, Action.RAISE_HALF, Action.CHECK_CALL)
+            if e_eff >= lo:
+                return _pick(obs, Action.RAISE_HALF, Action.CHECK_CALL)
+            if e_eff > call_at:
+                return _pick(obs, Action.CHECK_CALL)
+            return _pick(obs, Action.FOLD, Action.CHECK_CALL)
+        cuts = [(t - 0.5 + sub) / scale + 0.5 for t in (hi, lo, call_at)] if scale > 0 else []
+    # keep only cutoffs where the chosen (legal) action really changes
+    eps = 1e-9
+    return act, [t for t in cuts if act(t - eps) != act(t + eps)]
+
+
+def _rng(obs: Observation) -> np.random.Generator:
+    """Random stream fixed by the spot (deal, street, position in the hand): the same
+    spot gets the same samples, which makes paired comparisons of bot versions tight."""
+    key = (obs.hand_index, int(obs.street), len(obs.action_history),
+           sum(obs.hole_cards) * 37 + sum(obs.board))
+    return np.random.default_rng(key)
+
+
+def _decide(obs: Observation, memory: dict) -> Action:
+    pre = obs.street == Street.PREFLOP
+    act, cuts = _policy(obs, memory, pre)
+    rng = _rng(obs)
+    jit = P["jitter"]
+    if pre:
+        e = preflop_equity(obs.hole_cards)
+        return act(e + rng.normal(0.0, jit) if jit > 0 else e)
+    if not cuts:  # every equity gives the same action (e.g. only one legal move)
+        return act(0.5)
+    cap = FIXED_CAP or _sample_cap(obs, memory)
+    t0 = time.perf_counter()
+    e, n = equity(obs.hole_cards, obs.board, cuts, cap, Z_STOP, rng=rng)
+    dt = time.perf_counter() - t0
+    memory["mc_time"] = memory.get("mc_time", 0.0) + dt
+    memory["mcs"] = memory.get("mcs", 0) + 1
+    # EMA of seconds per sample by board size (river is far cheaper); tracks host speed
+    costs = memory.setdefault("cost", {})
+    b = max(dt - CALL_OVERHEAD, 1e-7) / n
+    costs[len(obs.board)] = 0.8 * costs.get(len(obs.board), b) + 0.2 * b
+    return act(e + rng.normal(0.0, jit) if jit > 0 else e)
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
     """Equity bot: preflop table + Monte Carlo postflop equity, pot-odds calls.
     Never raises: falls back to a legal action."""
+    t0 = time.perf_counter()
+    memory["reqs"] = memory.get("reqs", 0) + 1
     try:
         action = _decide(obs, memory)
         try:
@@ -199,10 +268,12 @@ def choose_action(obs: Observation, memory: dict) -> Action:
         if obs.to_call == 0 and Action.CHECK_CALL in obs.legal_actions:
             return Action.CHECK_CALL
         return _pick(obs, Action.FOLD, Action.CHECK_CALL)
+    finally:
+        memory["self_time"] = memory.get("self_time", 0.0) + time.perf_counter() - t0
 
 
 def _showdown_equity(opp_hole, board) -> float:
-    return postflop_equity_mc(opp_hole, board, 100)
+    return equity(opp_hole, board, (), 400)[0]
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
@@ -216,11 +287,13 @@ def on_hand_end(result: HandResult, memory: dict) -> None:
     went_to_showdown, board (cards revealed), opp_hole (opponent's cards,
     only after a showdown, else None), winner ('me', 'opp' or 'split').
     """
+    t0 = time.perf_counter()
     memory["hands_played"] = memory.get("hands_played", 0) + 1
     try:
         oppmodel.finish(result, memory["opp"], _showdown_equity)
     except Exception:
         traceback.print_exc()
+    memory["self_time"] = memory.get("self_time", 0.0) + time.perf_counter() - t0
 
 # ===== END OF YOUR CODE =====
 

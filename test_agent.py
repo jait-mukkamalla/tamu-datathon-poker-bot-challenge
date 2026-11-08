@@ -324,3 +324,142 @@ def test_situation_offset_zero_when_offsets_zero_and_spr_term(bot):
     finally:
         module.P.clear()
         module.P.update(saved)
+
+
+# ---------------------------------------------------------------------------
+# fast equity: dense tables, pools, river pair table, sequential stopping
+# ---------------------------------------------------------------------------
+
+def test_dense_scores_order_like_evaluator():
+    import numpy as np
+    from eqlib import omaha_dense
+    from evaluator import omaha_score
+
+    rng = np.random.default_rng(2)
+    d = np.argsort(rng.random((400, 36)), axis=1)[:, :15]
+    a, b = omaha_dense(d[:, :5], d[:, 10:]), omaha_dense(d[:, 5:10], d[:, 10:])
+    for r, x, y in zip(d, a, b):
+        ex = omaha_score(list(r[:5]), list(r[10:])) - omaha_score(list(r[5:10]), list(r[10:]))
+        assert np.sign(int(x) - int(y)) == np.sign(ex)
+
+
+def _exact_river(hole, board):
+    from itertools import combinations
+    from evaluator import omaha_score
+    used = set(hole) | set(board)
+    unseen = [c for c in range(36) if c not in used]
+    mine = omaha_score(list(hole), list(board))
+    w = t = n = 0
+    for opp in combinations(unseen, 5):
+        s = omaha_score(list(opp), list(board))
+        w += mine > s
+        t += mine == s
+        n += 1
+    return (w + 0.5 * t) / n
+
+
+def test_river_equity_matches_exact():
+    from eqlib import equity
+    for hole, board in (((0, 5, 10, 15, 21), (12, 13, 14, 20, 24)),
+                        ((1, 6, 11, 16, 30), (2, 7, 22, 27, 35))):
+        import numpy as np
+        got = equity(hole, board, (), 4000, rng=np.random.default_rng(7))[0]
+        assert abs(got - _exact_river(hole, board)) < 0.03
+
+
+def test_flop_turn_equity_reasonable():
+    from eqlib import equity
+    # suit-isomorphic boards give the same equity up to noise
+    import numpy as np
+    a = equity((32, 33, 28, 29, 24), (0, 5, 10), (), 4000, rng=np.random.default_rng(8))[0]
+    b = equity((33, 32, 29, 28, 25), (1, 4, 11), (), 4000, rng=np.random.default_rng(9))[0]
+    assert 0.0 < a < 1.0 and abs(a - b) < 0.05
+
+
+def test_sequential_stopping_saves_samples_only_when_safe():
+    import numpy as np
+    from eqlib import FIRST_CHUNK, equity
+    board = (12, 13, 14, 20, 24)
+    e, n = equity((0, 5, 10, 15, 21), board, (0.4,), 2000, rng=np.random.default_rng(3))
+    assert n == FIRST_CHUNK and e > 0.9   # quads vs a 0.4 cutoff: settled at once
+    e0 = equity((0, 1, 4, 5, 8), board, (), 20000, rng=np.random.default_rng(1))[0]
+    used = [equity((0, 1, 4, 5, 8), board, (e0,), 2000, rng=np.random.default_rng(s))[1]
+            for s in range(10)]                              # cutoff right at the equity
+    assert sorted(used)[5] > 500   # nearly always runs long (an early stop is a rare fluke)
+
+
+def _old_rule(module, obs, e, shade_adj, open_adj, margin_adj, pre):
+    """The pre-refactor decision rule, to check _policy decides exactly the same."""
+    P, pick = module.P, module._pick
+    off = module._situation_offset(obs, pre)
+    if obs.to_call == 0:
+        hi, lo = (P["pre_open_pot"], P["pre_open_half"]) if pre else (P["open_pot"], P["open_half"])
+        hi, lo = hi + open_adj + off, lo + open_adj + off
+        if e >= hi:
+            return pick(obs, Action.RAISE_POT, Action.RAISE_HALF, Action.CHECK_CALL)
+        if e >= lo:
+            return pick(obs, Action.RAISE_HALF, Action.CHECK_CALL)
+        return pick(obs, Action.CHECK_CALL)
+    e_eff = 0.5 + (e - 0.5) * P["shade_scale"] - P["shade_per_raise"] * obs.raises_this_street - shade_adj
+    pot_odds = obs.to_call / (obs.pot + obs.to_call)
+    hi, lo = (P["pre_raise_pot"], P["pre_raise_half"]) if pre else (P["raise_pot"], P["raise_half"])
+    hi, lo = hi + off, lo + off
+    margin = P["call_margin"] + margin_adj + (P["call_off_river"] if obs.street.name == "RIVER" else 0.0)
+    if e_eff >= hi:
+        return pick(obs, Action.RAISE_POT, Action.RAISE_HALF, Action.CHECK_CALL)
+    if e_eff >= lo:
+        return pick(obs, Action.RAISE_HALF, Action.CHECK_CALL)
+    if e_eff > pot_odds + margin:
+        return pick(obs, Action.CHECK_CALL)
+    return pick(obs, Action.FOLD, Action.CHECK_CALL)
+
+
+def test_policy_matches_old_rule_and_cutoffs_are_exact(bot):
+    import random as _r
+    from game import Street
+    module, _ = bot
+    rng = _r.Random(5)
+    grid = [i / 200 for i in range(201)]
+    checked = 0
+    for hand in range(150):
+        game = Game(make_deal("pol", hand), button_seat=hand % 2, hand_index=hand)
+        memory = {}
+        module.new_half(AgentConfig(), memory)
+        while not game.is_terminal:
+            obs = game.observation(game.to_act)
+            pre = obs.street == Street.PREFLOP
+            adj = (rng.uniform(-.06, .06), rng.uniform(-.06, .06), rng.uniform(-.02, .02))
+            module._opp_adjust = lambda o, m, p, adj=adj: adj
+            act, cuts = module._policy(obs, memory, pre)
+            for e in grid:
+                assert act(e) == _old_rule(module, obs, e, *adj, pre)
+            for t in cuts:   # every cutoff changes the action; none are missing
+                assert act(t - 1e-9) != act(t + 1e-9)
+            pts = sorted([0.0, 1.0] + [t for t in cuts if 0 < t < 1])
+            for a, b in zip(pts, pts[1:]):
+                mid = [a + (b - a) * f for f in (0.01, 0.5, 0.99)]
+                assert len({act(x) for x in mid}) == 1
+            checked += 1
+            legal = obs.legal_actions
+            game.apply(rng.choice(legal))
+    assert checked > 300
+
+
+def test_own_time_is_measured(bot):
+    module, client = bot
+    start_half(client)
+    play_hands(client, 20)
+    assert module.MEMORY["self_time"] > 0 and module.MEMORY["reqs"] > 0
+    assert module._spent(module.MEMORY) > module.MEMORY["self_time"]
+
+
+def test_server_plumbing_is_unchanged():
+    import subprocess
+    head = subprocess.run(["git", "show", "HEAD:agent.py"], capture_output=True, text=True,
+                          encoding="utf-8", cwd=BUNDLE)
+    if head.returncode != 0:
+        pytest.skip("no git history here")
+    mark = "# ===== SERVER PLUMBING"
+    cur = open(os.path.join(BUNDLE, "agent.py"), encoding="utf-8").read()
+    assert cur[cur.index(mark):] == head.stdout[head.stdout.index(mark):]
+
