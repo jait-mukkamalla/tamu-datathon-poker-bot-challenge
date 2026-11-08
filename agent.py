@@ -90,7 +90,7 @@ P = {
     # Bluffing when checked to: bet when the one-step EV of betting, using the
     # opponent's fold-to-raise rate and our equity vs their calling range, beats
     # checking by more than bluff_margin * pot. 0 = off.
-    "bluff_on": 1.0, "bluff_margin": 0.05,
+    "bluff_on": 1.0, "bluff_margin": 0.02,
 }
 try:  # LOCAL TUNING ONLY: the tournament never sets this variable
     import json as _json
