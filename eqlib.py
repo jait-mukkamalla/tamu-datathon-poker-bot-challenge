@@ -244,7 +244,8 @@ VAR_FLOOR = 0.01     # floor on the per-sample variance used for the standard er
 
 
 def _sampler(hole, board):
-    """Return draw(rows) -> per-sample outcomes (1 win, .5 tie, 0 loss) for pool rows."""
+    """Return (draw, opp_cards): draw(rows) gives per-sample outcomes (1 win, .5 tie,
+    0 loss) for pool rows, opp_cards(rows) the opponent's 5 cards in those samples."""
     tab, foff = dense_tables()
     hole = np.asarray(hole, dtype=np.int64)
     board = np.asarray(board, dtype=np.int64)
@@ -272,7 +273,8 @@ def _sampler(hole, board):
         def draw(rows):
             opp = S[pairs[rows]].max(axis=1)
             return (opp < mine) + 0.5 * (opp == mine)
-        return draw
+        pos5 = _pool(26)
+        return draw, lambda rows: unseen[pos5[rows]]
 
     # Flop/turn: sample (opponent hand, board completion). A pair+triple is a flush
     # iff the pair is suited and the triple is one suit, the same one, so compare
@@ -303,41 +305,126 @@ def _sampler(hole, board):
         np.add(k, size, out=k, where=(oc == tc))
         theirs = tab[k].reshape(n, 100).max(axis=1)
         return (mine > theirs) + 0.5 * (mine == theirs)
-    return draw
+    return draw, lambda rows: unseen[pool[rows, :5]]
+
+
+# ---------------------------------------------------------------------------
+# Opponent ranges (Poki-style weight tables, applied per sample)
+# ---------------------------------------------------------------------------
+# A range narrowing is (board_len, q): "at the moment the board had board_len cards
+# (0 = preflop), the opponent's action kept only about the top q of hands". Each
+# sampled opponent hand is ranked by strength at that moment (preflop: equity table;
+# postflop: made-hand score on that board) against the other samples, and weighted
+#     w = floor + (1 - floor) * clip((pct - (1 - q)) / RAMP + 0.5, 0, 1)
+# so hands far below the cutoff keep a small weight (nothing is ruled out) and the
+# cutoff is soft. Several narrowings multiply. Ranking ignores draws: crude, but
+# much closer than "random hand" once the opponent has bet or called.
+
+RANGE_FLOOR = 0.02
+RANGE_RAMP = 0.10
+_PID36 = np.zeros((36, 36), dtype=np.int64)
+_IA36, _IB36 = np.triu_indices(36, 1)                # 630 card pairs
+_PID36[_IA36, _IB36] = np.arange(len(_IA36))
+_PID36[_IB36, _IA36] = np.arange(len(_IA36))
+
+
+def _pair_strength(board_prefix) -> np.ndarray:
+    """(630,) best dense score of each card pair with any triple of a 3-5 card board."""
+    tab, foff = dense_tables()
+    b = np.asarray(board_prefix, dtype=np.int64)
+    trip = np.array(list(combinations(range(len(b)), 3)), dtype=np.int64)
+    br, bs = D_RK[b], D_SK[b]
+    tr = br[trip].sum(axis=1)
+    ts = bs[trip].sum(axis=1)
+    pr = D_RK[_IA36] + D_RK[_IB36]
+    ps = D_SK[_IA36] + D_SK[_IB36]
+    return tab[pr[:, None] + tr[None, :] + foff[ps[:, None] + ts[None, :]]].max(axis=1)
+
+
+def _strength_fn(board, board_len: int):
+    """Function opp_cards (n,5) -> strength (n,) at the time the board had board_len cards."""
+    if board_len == 0:
+        if _PREFLOP is None:
+            preflop_equity((0, 1, 2, 3, 4))
+        table = _PREFLOP
+        return lambda c: table[combo_index_arr(np.sort(c, axis=1))]
+    S = _pair_strength(tuple(board)[:board_len])
+    return lambda c: S[_PID36[c[:, PAIRS[:, 0]], c[:, PAIRS[:, 1]]]].max(axis=1)
+
+
+def _range_weights(strengths: list[np.ndarray], qs: list[float]) -> np.ndarray:
+    n = len(strengths[0])
+    w = np.ones(n)
+    for st, q in zip(strengths, qs):
+        srt = np.sort(st)
+        pct = (np.searchsorted(srt, st, "left") + np.searchsorted(srt, st, "right")) / (2.0 * n)
+        w *= RANGE_FLOOR + (1 - RANGE_FLOOR) * np.clip((pct - (1 - q)) / RANGE_RAMP + 0.5, 0, 1)
+    return w
+
+
+def range_equity(hole, board, ranges=(), thresholds=(), cap: int = 300, z: float = 3.0,
+                 rng=None, extra=()):
+    """Equity of `hole` vs the opponent's range on a 3/4/5-card board, by Monte Carlo.
+
+    ranges: narrowings (board_len, q) describing the range (see above); () = random.
+    thresholds: equity values where our decision changes; sampling stops once the
+        estimate is more than z standard errors (from the weighted effective sample
+        size) from every one. Looks after FIRST_CHUNK samples and each doubling, up
+        to `cap`; without thresholds exactly `cap` samples are used.
+    extra: further narrowings, each evaluated ON TOP of `ranges` at the end, e.g.
+        "equity vs the hands that would call a bet" for bluff/value decisions.
+    Returns (estimate, samples used, [equity for each extra narrowing])."""
+    rng = rng or _RNG
+    cap = max(1, int(cap))
+    draw, opp_cards = _sampler(hole, board)
+    ranges = [(bl, q) for bl, q in ranges if q < 0.999]
+    allr = ranges + [(bl, q) for bl, q in extra]
+    fns = [_strength_fn(board, bl) for bl, _ in allr]
+    th = [t for t in thresholds if 0.0 < t < 1.0]
+    xs: list[np.ndarray] = []
+    sts: list[list[np.ndarray]] = [[] for _ in allr]
+    n = 0
+    chunk = cap if not th else min(FIRST_CHUNK, cap)
+    while True:
+        rows = rng.integers(0, POOL_ROWS, chunk)
+        xs.append(draw(rows))
+        if fns:
+            oc = opp_cards(rows)
+            for i, f in enumerate(fns):
+                sts[i].append(f(oc))
+        n += chunk
+        x = np.concatenate(xs) if len(xs) > 1 else xs[0]
+        if ranges:
+            w = _range_weights([np.concatenate(v) for v in sts[:len(ranges)]],
+                               [q for _, q in ranges])
+            sw = w.sum()
+            p = float((w * x).sum() / sw)
+            n_eff = sw * sw / float((w * w).sum())
+            var = float((w * (x - p) ** 2).sum() / sw)
+        else:
+            p, n_eff = float(x.mean()), float(n)
+            var = float(x.var())
+        if n >= cap or (th and min(abs(p - t) for t in th)
+                        > z * (max(var, VAR_FLOOR) / n_eff) ** 0.5):
+            break
+        chunk = min(n, cap - n)
+    extras = []
+    if extra:
+        all_st = [np.concatenate(v) for v in sts]
+        base = _range_weights(all_st[:len(ranges)], [q for _, q in ranges]) if ranges else 1.0
+        for j, (_, q) in enumerate(extra):
+            w = base * _range_weights([all_st[len(ranges) + j]], [q])
+            extras.append(float((w * x).sum() / w.sum()))
+    return p, n, extras
 
 
 def equity(hole, board, thresholds=(), cap: int = 300, z: float = 3.0,
            rng=None) -> tuple[float, int]:
     """Equity (win + tie/2) of `hole` vs one uniformly random hand on a 3/4/5-card
-    board, by Monte Carlo. Returns (estimate, samples used).
-
-    With `thresholds` (equity values where our decision changes), sampling stops
-    as soon as the estimate is more than z standard errors from every threshold:
-    the decision is then settled and more samples would not change it. Looks
-    happen after FIRST_CHUNK samples and then each time the count doubles, up to
-    `cap`. Without thresholds exactly `cap` samples are used."""
-    rng = rng or _RNG
-    cap = max(1, int(cap))
-    draw = _sampler(hole, board)
-    th = [t for t in thresholds if 0.0 < t < 1.0]
-    if not th:
-        x = draw(rng.integers(0, POOL_ROWS, cap))
-        return float(x.mean()), cap
-    s = s2 = 0.0
-    n = 0
-    chunk = min(FIRST_CHUNK, cap)
-    while True:
-        x = draw(rng.integers(0, POOL_ROWS, chunk))
-        s += float(x.sum())
-        s2 += float((x * x).sum())
-        n += chunk
-        p = s / n
-        if n >= cap:
-            return p, n
-        se = (max(s2 / n - p * p, VAR_FLOOR) / n) ** 0.5
-        if min(abs(p - t) for t in th) > z * se:
-            return p, n
-        chunk = min(n, cap - n)
+    board, by Monte Carlo. Returns (estimate, samples used). With `thresholds`
+    sampling stops early once the decision is settled (see range_equity)."""
+    p, n, _ = range_equity(hole, board, (), thresholds, cap, z, rng)
+    return p, n
 
 
 def warm() -> None:

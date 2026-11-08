@@ -463,3 +463,26 @@ def test_server_plumbing_is_unchanged():
     cur = open(os.path.join(BUNDLE, "agent.py"), encoding="utf-8").read()
     assert cur[cur.index(mark):] == head.stdout[head.stdout.index(mark):]
 
+
+def test_range_and_bluff_modes_play_legally(bot):
+    module, client = bot
+    module.P.update(range_on=1.0, bluff_on=1.0, jitter=0.02)
+    module.FIXED_CAP = 300   # sample counts independent of machine speed: repeatable
+    start_half(client)
+    chosen = play_hands(client, 120, seed="ranges", raise_rate=0.5)
+    assert Action.RAISE_HALF in chosen or Action.RAISE_POT in chosen
+
+
+def test_ranges_from_history(bot):
+    from game import Street
+    module, _ = bot
+    memory = {}
+    module.new_half(AgentConfig(), memory)
+
+    class O:
+        action_history = _hist(("PREFLOP", False, "RAISE_POT"), ("PREFLOP", True, "CHECK_CALL"),
+                               ("FLOP", True, "RAISE_HALF"), ("FLOP", False, "CHECK_CALL"),
+                               ("TURN", False, "CHECK_CALL"))
+    r = module._ranges(O, memory)
+    assert [bl for bl, _ in r] == [0, 3]          # preflop raise, flop call of our bet
+    assert all(module.Q_MIN <= q < 1 for _, q in r)

@@ -32,7 +32,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from evaluator import card_rank, card_suit, cards_to_str, omaha_score, warmup  # handy helpers, see evaluator.py
-from eqlib import equity, preflop_equity, warm  # noqa: E402
+from eqlib import equity, preflop_equity, range_equity, warm  # noqa: E402
 import oppmodel
 from game import Action, AgentConfig, HandResult, Observation, Street
 
@@ -81,6 +81,15 @@ P = {
     "spr_coef": -0.03,     # offset -= spr_coef * (3 - min(SPR, 6)) / 3: >0 pushes harder when shallow
     "call_off_river": 0.02,  # extra river call margin
     "jitter": 0.0,         # std of random noise added to equity before deciding (mixing)
+    # Range-weighted equity: each opponent bet/raise keeps the top q = (their raise
+    # frequency) ** range_pow of hands, each call of our raise the top (1 - their
+    # fold-to-raise rate) ** range_pow; the power is scaled down when showdowns show
+    # their bets are not stronger than random. 0 = off (equity vs a random hand).
+    "range_on": 1.0, "range_pow": 1.0,
+    # Bluffing when checked to: bet when the one-step EV of betting, using the
+    # opponent's fold-to-raise rate and our equity vs their calling range, beats
+    # checking by more than bluff_margin * pot. 0 = off.
+    "bluff_on": 1.0, "bluff_margin": 0.05,
 }
 try:  # LOCAL TUNING ONLY: the tournament never sets this variable
     import json as _json
@@ -220,6 +229,55 @@ def _policy(obs: Observation, memory: dict, pre: bool):
     return act, [t for t in cuts if act(t - eps) != act(t + eps)]
 
 
+_BOARD_LEN = {Street.PREFLOP: 0, Street.FLOP: 3, Street.TURN: 4, Street.RIVER: 5}
+_RAISES = (Action.RAISE_HALF, Action.RAISE_POT)
+Q_MIN = 0.12   # never narrow a range below this fraction per action
+
+
+def _ranges(obs: Observation, memory: dict) -> list[tuple[int, float]]:
+    """Range narrowings (board_len, q) implied by the opponent's actions this hand."""
+    st = memory["opp"]
+    f = {g: oppmodel.freqs(st, g) for g in (True, False)}
+    # narrow only as far as showdowns show their actions mean strength: a bot that
+    # bets random hands gets (almost) no narrowing
+    pw = P["range_pow"] * oppmodel.bet_signal(st)
+    if pw <= 0:
+        return []
+    out = []
+    hist = obs.action_history
+    for i, a in enumerate(hist):
+        if a.is_me:
+            continue
+        agg, ftr = f[a.street == Street.PREFLOP]
+        prev = hist[i - 1] if i > 0 else None
+        if a.action in _RAISES:
+            q = agg
+        elif a.action == Action.CHECK_CALL and prev is not None and prev.is_me and prev.action in _RAISES:
+            q = 1.0 - ftr
+        else:
+            continue
+        out.append((_BOARD_LEN[a.street], max(Q_MIN, q ** pw)))
+    return out
+
+
+def _bluff(obs: Observation, memory: dict, e: float, e_call: float, f: float) -> Action | None:
+    """Best bluff/semi-bluff bet when checking was the plan, or None.
+
+    One-step EV relative to checking, in chips:
+        bet B into pot P:  f * P + (1 - f) * (e_call * (P + 2B) - B)
+        check:             e * P
+    (ignores later streets and opponent raises; bluff_margin absorbs the rest)."""
+    best, best_gain = None, P["bluff_margin"] * obs.pot
+    for a in _RAISES:
+        if a not in obs.legal_actions:
+            continue
+        b = obs.raise_to[a] - obs.my_bet
+        gain = f * obs.pot + (1 - f) * (e_call * (obs.pot + 2 * b) - b) - e * obs.pot
+        if gain > best_gain:
+            best, best_gain = a, gain
+    return best
+
+
 def _rng(obs: Observation) -> np.random.Generator:
     """Random stream fixed by the spot (deal, street, position in the hand): the same
     spot gets the same samples, which makes paired comparisons of bot versions tight."""
@@ -239,8 +297,13 @@ def _decide(obs: Observation, memory: dict) -> Action:
     if not cuts:  # every equity gives the same action (e.g. only one legal move)
         return act(0.5)
     cap = FIXED_CAP or _sample_cap(obs, memory)
+    ranges = _ranges(obs, memory) if P["range_on"] else []
+    bluff = P["bluff_on"] and obs.to_call == 0 and any(a in obs.legal_actions for a in _RAISES)
+    f = oppmodel.freqs(memory["opp"], False)[1] if bluff else 0.0
+    extra = [(len(obs.board), max(Q_MIN, 1.0 - f))] if bluff else []
     t0 = time.perf_counter()
-    e, n = equity(obs.hole_cards, obs.board, cuts, cap, Z_STOP, rng=rng)
+    e, n, ex = range_equity(obs.hole_cards, obs.board, ranges, cuts, cap, Z_STOP, rng=rng,
+                            extra=extra)
     dt = time.perf_counter() - t0
     memory["mc_time"] = memory.get("mc_time", 0.0) + dt
     memory["mcs"] = memory.get("mcs", 0) + 1
@@ -248,7 +311,12 @@ def _decide(obs: Observation, memory: dict) -> Action:
     costs = memory.setdefault("cost", {})
     b = max(dt - CALL_OVERHEAD, 1e-7) / n
     costs[len(obs.board)] = 0.8 * costs.get(len(obs.board), b) + 0.2 * b
-    return act(e + rng.normal(0.0, jit) if jit > 0 else e)
+    if jit > 0:
+        e = e + rng.normal(0.0, jit)
+    action = act(e)
+    if bluff and action == Action.CHECK_CALL:
+        action = _bluff(obs, memory, e, ex[0], f) or action
+    return action
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:

@@ -106,6 +106,20 @@ def _clamp(x: float, lim: float) -> float:
     return max(-lim, min(lim, x))
 
 
+def freqs(st: dict, pre: bool) -> tuple[float, float]:
+    """(P(raise | opponent acts), P(fold | opponent faces our raise)), shrunk to priors."""
+    g = "pre" if pre else "post"
+    return _est(*st["agg"][g], PRIOR_AGG[g]), _est(*st["ftr"][g], PRIOR_FTR[g])
+
+
+def bet_signal(st: dict) -> float:
+    """How much the opponent's postflop bets mean strength, from showdowns: 1 at the
+    prior (their betting hands average PRIOR_BET_EQ river equity), 0 when they bet
+    random hands (about 0.5), up to 1.5 for very value-heavy bettors."""
+    bet_eq = _est(st["sd_bet"][0], st["sd_bet"][1], PRIOR_BET_EQ)
+    return max(0.0, min(1.5, (bet_eq - 0.5) / (PRIOR_BET_EQ[0] - 0.5)))
+
+
 def adjustments(st: dict, pre: bool) -> tuple[float, float, float]:
     """Returns (shade_adj, open_adj, margin_adj), each already clamped and ramped.
 
