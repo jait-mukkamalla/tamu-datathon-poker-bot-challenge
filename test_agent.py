@@ -306,7 +306,7 @@ def test_bot_survives_a_long_match_with_model(bot):
     play_hands(client, 40, raise_rate=0.8)
 
 
-def test_situation_offset_defaults_are_neutral_and_spr_pushes_when_shallow(bot):
+def test_situation_offset_zero_when_offsets_zero_and_spr_term(bot):
     from game import Street
 
     module, _ = bot
@@ -314,9 +314,11 @@ def test_situation_offset_defaults_are_neutral_and_spr_pushes_when_shallow(bot):
     class O:
         street, is_button, my_stack, opp_stack, pot = Street.RIVER, True, 10, 10, 100
 
-    assert module._situation_offset(O, False) == 0.0
     saved = dict(module.P)
     try:
+        module.P.update({k: 0.0 for k in ("off_flop", "off_turn", "off_river", "off_ip",
+                                          "pre_off_btn", "spr_coef")})
+        assert module._situation_offset(O, False) == 0.0
         module.P.update(spr_coef=0.03, off_river=-0.02, off_ip=-0.01)
         assert abs(module._situation_offset(O, False) - (-0.03 - 0.03 * (3 - 0.1) / 3)) < 1e-9
     finally:
