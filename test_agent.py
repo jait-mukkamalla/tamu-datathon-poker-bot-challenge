@@ -304,3 +304,21 @@ def test_bot_survives_a_long_match_with_model(bot):
     play_hands(client, 60)
     start_half(client, half=2, seat=1)
     play_hands(client, 40, raise_rate=0.8)
+
+
+def test_situation_offset_defaults_are_neutral_and_spr_pushes_when_shallow(bot):
+    from game import Street
+
+    module, _ = bot
+
+    class O:
+        street, is_button, my_stack, opp_stack, pot = Street.RIVER, True, 10, 10, 100
+
+    assert module._situation_offset(O, False) == 0.0
+    saved = dict(module.P)
+    try:
+        module.P.update(spr_coef=0.03, off_river=-0.02, off_ip=-0.01)
+        assert abs(module._situation_offset(O, False) - (-0.03 - 0.03 * (3 - 0.1) / 3)) < 1e-9
+    finally:
+        module.P.clear()
+        module.P.update(saved)

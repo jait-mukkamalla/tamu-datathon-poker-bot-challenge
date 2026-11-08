@@ -63,13 +63,28 @@ def new_half(config: AgentConfig, memory: dict) -> None:
     memory["opp"] = oppmodel.new_state()
 
 
-# Thresholds are on equity vs a random hand, after shading for opponent aggression.
+# Policy parameters. Thresholds are on equity vs a random hand (after shading when
+# facing a bet). Offsets are ADDED to the bet/raise thresholds, so a negative offset
+# means "more aggressive in this situation".
+P = {
+    "open_pot": 0.72, "open_half": 0.58,          # postflop, bet when checked to
+    "raise_pot": 0.80, "raise_half": 0.68,        # postflop, raise when facing a bet
+    "pre_open_pot": 0.62, "pre_open_half": 0.55,  # preflop, nothing to call beyond the blind
+    "pre_raise_pot": 0.66, "pre_raise_half": 0.58,  # preflop, facing a raise
+    "call_margin": 0.04,                          # extra equity over pot odds to call
+    "shade_scale": 0.85, "shade_per_raise": 0.04,  # facing a bet: their range beats random
+    "off_flop": 0.0, "off_turn": 0.0, "off_river": 0.0,  # postflop offsets by street
+    "off_ip": 0.0,         # postflop offset when we act last (we are the button)
+    "pre_off_btn": 0.0,    # preflop offset when we are the button
+    "spr_coef": 0.0,       # offset -= spr_coef * (3 - min(SPR, 6)) / 3: >0 pushes harder when shallow
+    "call_off_river": 0.0,  # extra river call margin
+}
+try:  # LOCAL TUNING ONLY: the tournament never sets this variable
+    import json as _json
+    P.update(_json.loads(os.environ.get("BOT_PARAMS", "{}")))
+except Exception:
+    pass
 SAMPLES = 300
-OPEN_POT, OPEN_HALF = 0.72, 0.58        # bet when checked to
-RAISE_POT_T, RAISE_HALF_T = 0.80, 0.68  # raise when facing a bet
-PRE_OPEN_POT, PRE_OPEN_HALF = 0.62, 0.55
-CALL_MARGIN = 0.04                      # extra equity over pot odds to call
-SHADE_SCALE, SHADE_PER_RAISE = 0.85, 0.04
 TIME_BUDGET = 2.0   # seconds of our own compute per half; the judge counts ~2x (HTTP overhead, load)
 MIN_SAMPLES = 20
 CALL_OVERHEAD = 3e-4  # fixed seconds per MC call (numpy setup), independent of sample count
@@ -112,6 +127,19 @@ def _opp_adjust(obs: Observation, memory: dict, pre: bool) -> tuple[float, float
         return 0.0, 0.0, 0.0
 
 
+def _situation_offset(obs: Observation, pre: bool) -> float:
+    """Threshold offset for street, position and stack-to-pot ratio (negative = bolder)."""
+    if pre:
+        off = P["pre_off_btn"] if obs.is_button else 0.0
+    else:
+        off = {Street.FLOP: P["off_flop"], Street.TURN: P["off_turn"],
+               Street.RIVER: P["off_river"]}.get(obs.street, 0.0)
+        if obs.is_button:
+            off += P["off_ip"]
+    spr = min(obs.my_stack, obs.opp_stack) / max(obs.pot, 1)
+    return off - P["spr_coef"] * (3.0 - min(spr, 6.0)) / 3.0
+
+
 def _decide(obs: Observation, memory: dict) -> Action:
     t0 = time.perf_counter()
     pre = obs.street == Street.PREFLOP
@@ -129,9 +157,10 @@ def _decide(obs: Observation, memory: dict) -> Action:
         memory["cost"] = 0.8 * memory.get("cost", b) + 0.2 * b
 
     shade_adj, open_adj, margin_adj = _opp_adjust(obs, memory, pre)
+    off = _situation_offset(obs, pre)
     if obs.to_call == 0:
-        hi, lo = (PRE_OPEN_POT, PRE_OPEN_HALF) if pre else (OPEN_POT, OPEN_HALF)
-        hi, lo = hi + open_adj, lo + open_adj
+        hi, lo = (P["pre_open_pot"], P["pre_open_half"]) if pre else (P["open_pot"], P["open_half"])
+        hi, lo = hi + open_adj + off, lo + open_adj + off
         if e >= hi:
             return _pick(obs, Action.RAISE_POT, Action.RAISE_HALF, Action.CHECK_CALL)
         if e >= lo:
@@ -139,14 +168,17 @@ def _decide(obs: Observation, memory: dict) -> Action:
         return _pick(obs, Action.CHECK_CALL)
 
     # Facing a bet the opponent's range is stronger than random: shade equity down.
-    e_eff = 0.5 + (e - 0.5) * SHADE_SCALE - SHADE_PER_RAISE * obs.raises_this_street - shade_adj
+    e_eff = (0.5 + (e - 0.5) * P["shade_scale"] - P["shade_per_raise"] * obs.raises_this_street
+             - shade_adj)
     pot_odds = obs.to_call / (obs.pot + obs.to_call)
-    hi, lo = (RAISE_POT_T - 0.14, RAISE_HALF_T - 0.10) if pre else (RAISE_POT_T, RAISE_HALF_T)
+    hi, lo = (P["pre_raise_pot"], P["pre_raise_half"]) if pre else (P["raise_pot"], P["raise_half"])
+    hi, lo = hi + off, lo + off
+    margin = P["call_margin"] + margin_adj + (P["call_off_river"] if obs.street == Street.RIVER else 0.0)
     if e_eff >= hi:
         return _pick(obs, Action.RAISE_POT, Action.RAISE_HALF, Action.CHECK_CALL)
     if e_eff >= lo:
         return _pick(obs, Action.RAISE_HALF, Action.CHECK_CALL)
-    if e_eff > pot_odds + CALL_MARGIN + margin_adj:
+    if e_eff > pot_odds + margin:
         return _pick(obs, Action.CHECK_CALL)
     return _pick(obs, Action.FOLD, Action.CHECK_CALL)
 
