@@ -1,2 +1,4 @@
 fastapi==0.156.1
 uvicorn==0.54.0
+# used by eqlib.py (already in the base image; listed so the dependency is explicit)
+numpy
