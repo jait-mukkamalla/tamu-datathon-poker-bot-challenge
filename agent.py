@@ -66,15 +66,16 @@ def new_half(config: AgentConfig, memory: dict) -> None:
 
 # Policy parameters. Thresholds are on equity vs a random hand (after shading when
 # facing a bet). Offsets are ADDED to the bet/raise thresholds, so a negative offset
-# means "more aggressive in this situation". Values from tools/tune.py (2 rounds of
-# coordinate search vs a pool of our earlier bots), validated on held-out seeds.
+# means "more aggressive in this situation". Values from tools/tune.py (coordinate
+# search vs a pool of our earlier bots and baselines), last retuned with range-weighted
+# equity and bluffing on, and validated on held-out seeds against each opponent.
 P = {
-    "open_pot": 0.70, "open_half": 0.54,          # postflop, bet when checked to
+    "open_pot": 0.70, "open_half": 0.50,          # postflop, bet when checked to
     "raise_pot": 0.80, "raise_half": 0.68,        # postflop, raise when facing a bet
     "pre_open_pot": 0.62, "pre_open_half": 0.51,  # preflop, nothing to call beyond the blind
-    "pre_raise_pot": 0.66, "pre_raise_half": 0.58,  # preflop, facing a raise
+    "pre_raise_pot": 0.66, "pre_raise_half": 0.62,  # preflop, facing a raise
     "call_margin": 0.06,                          # extra equity over pot odds to call
-    "shade_scale": 0.90, "shade_per_raise": 0.06,  # facing a bet: their range beats random
+    "shade_scale": 0.85, "shade_per_raise": 0.06,  # facing a bet: their range beats random
     "off_flop": -0.03, "off_turn": 0.0, "off_river": 0.0,  # postflop offsets by street
     "off_ip": 0.0,         # postflop offset when we act last (we are the button)
     "pre_off_btn": 0.0,    # preflop offset when we are the button
