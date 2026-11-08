@@ -111,8 +111,8 @@ def adjustments(st: dict, pre: bool) -> tuple[float, float, float]:
 
     shade_adj  > 0: opponent's bets are stronger than assumed, so shade our equity
                     down more when facing a bet (fold more).
-    open_adj   > 0: raise our thresholds for betting when checked to (bet less);
-                    < 0 bets more (they fold a lot / call too weakly).
+    open_adj   > 0: raise our thresholds for betting when checked to (bet less: they
+                    call with strong hands); < 0 bets more (they fold a lot / call weakly).
     margin_adj > 0: need more equity over pot odds to call.
     """
     g = "pre" if pre else "post"
@@ -121,7 +121,9 @@ def adjustments(st: dict, pre: bool) -> tuple[float, float, float]:
     agg0, ftr0 = PRIOR_AGG[g][0], PRIOR_FTR[g][0]
 
     shade = -_clamp((agg - agg0) * 0.2, 0.03)          # very aggressive -> bets are weaker
-    open_ = -_clamp((ftr - ftr0) * 0.3, 0.04)          # they fold a lot -> bet more
+    # they fold a lot -> bet more. One-sided: a station that never folds must not make us
+    # stop value betting, so a low fold rate never raises the thresholds.
+    open_ = -_clamp(max(ftr - ftr0, 0.0) * 0.3, 0.04)
     margin = -_clamp((agg - agg0) * 0.1, 0.02)
     if not pre:
         bet_eq = _est(st["sd_bet"][0], st["sd_bet"][1], PRIOR_BET_EQ)
