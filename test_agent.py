@@ -232,3 +232,75 @@ def test_postflop_equity_mc_sane():
     weak = postflop_equity_mc((0, 1, 4, 5, 8), board, 300)
     assert 0.0 <= weak <= 1.0 and 0.0 <= strong <= 1.0
     assert strong > weak
+
+
+# ---------------------------------------------------------------------------
+# opponent model
+# ---------------------------------------------------------------------------
+
+def _hist(*items):
+    from game import ObservedAction, Street
+    return tuple(ObservedAction(Street[s], me, Action[a], 0, 0) for s, me, a in items)
+
+
+class _Obs:
+    def __init__(self, hand_index, street, history):
+        from game import Street
+        self.hand_index, self.street, self.action_history = hand_index, Street[street], history
+
+
+class _Res:
+    def __init__(self, hand_index, winner="me", showdown=False, opp_hole=None, board=()):
+        self.hand_index, self.winner, self.went_to_showdown = hand_index, winner, showdown
+        self.opp_hole, self.board = opp_hole, board
+
+
+def test_opp_model_counts_each_action_once():
+    import oppmodel
+    st = oppmodel.new_state()
+    h1 = _hist(("PREFLOP", True, "RAISE_POT"), ("PREFLOP", False, "CHECK_CALL"))
+    oppmodel.observe(_Obs(0, "FLOP", h1), st)
+    oppmodel.observe(_Obs(0, "FLOP", h1), st)   # same history again: no double count
+    assert st["agg"]["pre"] == [0, 1] and st["ftr"]["pre"] == [0, 1]
+    h2 = h1 + _hist(("FLOP", False, "RAISE_HALF"))
+    oppmodel.observe(_Obs(0, "FLOP", h2), st)
+    assert st["agg"]["post"] == [1, 1] and st["opp_bet_post"]
+
+
+def test_opp_model_fold_to_our_raise_is_settled_at_hand_end():
+    import oppmodel
+    st = oppmodel.new_state()
+    oppmodel.observe(_Obs(3, "FLOP", ()), st)
+    oppmodel.note_my_action(_Obs(3, "FLOP", ()), Action.RAISE_POT, st)
+    oppmodel.finish(_Res(3, winner="me", showdown=False), st)
+    assert st["ftr"]["post"] == [1, 1] and st["pending"] is None
+
+
+def test_opp_model_showdown_strength_and_clamps():
+    import oppmodel
+    st = oppmodel.new_state()
+    oppmodel.observe(_Obs(0, "RIVER", _hist(("RIVER", False, "RAISE_POT"))), st)
+    oppmodel.finish(_Res(0, "opp", True, (0, 1, 2, 3, 4), (5, 6, 7, 8, 9)), st, lambda h, b: 0.95)
+    assert st["sd_bet"] == [0.95, 1]
+    # extreme counts still give clamped, finite shifts
+    st["hands"] = 500
+    st["agg"]["post"], st["ftr"]["post"] = [10 ** 6, 10 ** 6], [10 ** 6, 10 ** 6]
+    st["sd_bet"], st["sd_call"] = [10 ** 6, 10 ** 6], [0.0, 10 ** 6]
+    for pre in (True, False):
+        s, o, m = oppmodel.adjustments(st, pre)
+        assert abs(s) <= 0.06 and abs(o) <= 0.06 and abs(m) <= 0.02
+
+
+def test_opp_model_no_shift_during_warmup():
+    import oppmodel
+    st = oppmodel.new_state()
+    st["agg"]["post"] = [50, 50]
+    assert oppmodel.adjustments(st, False) == (0.0, 0.0, 0.0)   # 0 hands seen yet
+
+
+def test_bot_survives_a_long_match_with_model(bot):
+    _, client = bot
+    start_half(client)
+    play_hands(client, 60)
+    start_half(client, half=2, seat=1)
+    play_hands(client, 40, raise_rate=0.8)

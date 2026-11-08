@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse
 
 from evaluator import card_rank, card_suit, cards_to_str, omaha_score, warmup  # handy helpers, see evaluator.py
 from eqlib import postflop_equity_mc, preflop_equity, warm  # noqa: E402
+import oppmodel
 from game import Action, AgentConfig, HandResult, Observation, Street
 
 # Build omaha_score's lookup table now, while the server starts, instead of
@@ -59,6 +60,7 @@ def new_half(config: AgentConfig, memory: dict) -> None:
     so nothing you learn in one half carries over to the other half.
     """
     memory["hands_played"] = 0
+    memory["opp"] = oppmodel.new_state()
 
 
 # Thresholds are on equity vs a random hand, after shading for opponent aggression.
@@ -98,6 +100,18 @@ def _samples(obs: Observation, memory: dict) -> int:
     return n
 
 
+def _opp_adjust(obs: Observation, memory: dict, pre: bool) -> tuple[float, float, float]:
+    """Update the opponent model from the history and return its (clamped) shifts.
+    Any failure just means no adjustment."""
+    try:
+        st = memory["opp"]
+        oppmodel.observe(obs, st)
+        return oppmodel.adjustments(st, pre)
+    except Exception:
+        traceback.print_exc()
+        return 0.0, 0.0, 0.0
+
+
 def _decide(obs: Observation, memory: dict) -> Action:
     t0 = time.perf_counter()
     pre = obs.street == Street.PREFLOP
@@ -114,8 +128,10 @@ def _decide(obs: Observation, memory: dict) -> Action:
         b = max(dt - CALL_OVERHEAD, 1e-7) / n
         memory["cost"] = 0.8 * memory.get("cost", b) + 0.2 * b
 
+    shade_adj, open_adj, margin_adj = _opp_adjust(obs, memory, pre)
     if obs.to_call == 0:
         hi, lo = (PRE_OPEN_POT, PRE_OPEN_HALF) if pre else (OPEN_POT, OPEN_HALF)
+        hi, lo = hi + open_adj, lo + open_adj
         if e >= hi:
             return _pick(obs, Action.RAISE_POT, Action.RAISE_HALF, Action.CHECK_CALL)
         if e >= lo:
@@ -123,14 +139,14 @@ def _decide(obs: Observation, memory: dict) -> Action:
         return _pick(obs, Action.CHECK_CALL)
 
     # Facing a bet the opponent's range is stronger than random: shade equity down.
-    e_eff = 0.5 + (e - 0.5) * SHADE_SCALE - SHADE_PER_RAISE * obs.raises_this_street
+    e_eff = 0.5 + (e - 0.5) * SHADE_SCALE - SHADE_PER_RAISE * obs.raises_this_street - shade_adj
     pot_odds = obs.to_call / (obs.pot + obs.to_call)
     hi, lo = (RAISE_POT_T - 0.14, RAISE_HALF_T - 0.10) if pre else (RAISE_POT_T, RAISE_HALF_T)
     if e_eff >= hi:
         return _pick(obs, Action.RAISE_POT, Action.RAISE_HALF, Action.CHECK_CALL)
     if e_eff >= lo:
         return _pick(obs, Action.RAISE_HALF, Action.CHECK_CALL)
-    if e_eff > pot_odds + CALL_MARGIN:
+    if e_eff > pot_odds + CALL_MARGIN + margin_adj:
         return _pick(obs, Action.CHECK_CALL)
     return _pick(obs, Action.FOLD, Action.CHECK_CALL)
 
@@ -139,12 +155,21 @@ def choose_action(obs: Observation, memory: dict) -> Action:
     """Equity bot: preflop table + Monte Carlo postflop equity, pot-odds calls.
     Never raises: falls back to a legal action."""
     try:
-        return _decide(obs, memory)
+        action = _decide(obs, memory)
+        try:
+            oppmodel.note_my_action(obs, action, memory["opp"])
+        except Exception:
+            traceback.print_exc()
+        return action
     except Exception:
         traceback.print_exc()
         if obs.to_call == 0 and Action.CHECK_CALL in obs.legal_actions:
             return Action.CHECK_CALL
         return _pick(obs, Action.FOLD, Action.CHECK_CALL)
+
+
+def _showdown_equity(opp_hole, board) -> float:
+    return postflop_equity_mc(opp_hole, board, 100)
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
@@ -158,7 +183,11 @@ def on_hand_end(result: HandResult, memory: dict) -> None:
     went_to_showdown, board (cards revealed), opp_hole (opponent's cards,
     only after a showdown, else None), winner ('me', 'opp' or 'split').
     """
-    memory["hands_played"] += 1
+    memory["hands_played"] = memory.get("hands_played", 0) + 1
+    try:
+        oppmodel.finish(result, memory["opp"], _showdown_equity)
+    except Exception:
+        traceback.print_exc()
 
 # ===== END OF YOUR CODE =====
 
